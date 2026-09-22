@@ -28,6 +28,10 @@ type Conn struct {
 	// numbers when Conn.Send is called.
 	seq uint32
 
+	// broken marks a connection as unusable after a receive transaction did
+	// not reach a clean netlink message boundary.
+	broken atomic.Bool
+
 	// mu serializes access to the netlink socket for the request/response
 	// transaction within Execute.
 	mu sync.RWMutex
@@ -143,7 +147,7 @@ func (c *Conn) Execute(m Message) ([]Message, error) {
 		return nil, err
 	}
 
-	res, err := c.lockedReceive()
+	res, err := c.lockedReceive(&req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -162,6 +166,10 @@ func (c *Conn) SendMessages(msgs []Message) ([]Message, error) {
 	// Wait for any concurrent calls to Execute to finish before proceeding.
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	if err := c.checkUsable(); err != nil {
+		return nil, err
+	}
 
 	for i := range msgs {
 		c.fixMsg(&msgs[i], nlmsgLength(len(msgs[i].Data)))
@@ -209,6 +217,10 @@ func (c *Conn) Send(m Message) (Message, error) {
 // We rely on the kernel to deal with concurrent reads and writes to the netlink
 // socket itself.
 func (c *Conn) lockedSend(m Message) (Message, error) {
+	if err := c.checkUsable(); err != nil {
+		return Message{}, err
+	}
+
 	c.fixMsg(&m, nlmsgLength(len(m.Data)))
 
 	c.debug(func(d *debugger) {
@@ -240,7 +252,7 @@ func (c *Conn) Receive() ([]Message, error) {
 	c.receiveMu.Lock()
 	defer c.receiveMu.Unlock()
 
-	return c.lockedReceive()
+	return c.lockedReceive(nil, true)
 }
 
 // ReceiveIter returns an iterator which can be used to receive messages from
@@ -248,7 +260,7 @@ func (c *Conn) Receive() ([]Message, error) {
 // netlink errors are returned as errors from the iterator.
 //
 // If the iteration is stopped before all messages have been read and the
-// response is multi-part, the remaining messages will be discarded.
+// response is multi-part, the Conn is marked unusable.
 func (c *Conn) ReceiveIter() iter.Seq2[Message, error] {
 	return func(yield func(Message, error) bool) {
 		// Wait for any concurrent calls to Execute to finish before proceeding.
@@ -259,7 +271,7 @@ func (c *Conn) ReceiveIter() iter.Seq2[Message, error] {
 		c.receiveMu.Lock()
 		defer c.receiveMu.Unlock()
 
-		for msg, err := range c.lockedReceiveIter() {
+		for msg, err := range c.lockedReceiveIter(nil) {
 			if err != nil {
 				c.debug(func(d *debugger) {
 					d.debugf(1, "recv: err: %v", err)
@@ -281,10 +293,10 @@ func (c *Conn) ReceiveIter() iter.Seq2[Message, error] {
 // lockedReceive implements Receive, but must be called with c.mu acquired for reading.
 // We rely on the kernel to deal with concurrent reads and writes to the netlink
 // socket itself.
-func (c *Conn) lockedReceive() ([]Message, error) {
+func (c *Conn) lockedReceive(request *Message, skipAcknowledgement bool) ([]Message, error) {
 	var msgs []Message
 
-	for m, err := range c.lockedReceiveIter() {
+	for m, err := range c.lockedReceiveIter(request) {
 		if err != nil {
 			c.debug(func(d *debugger) {
 				d.debugf(1, "recv: err: %v", err)
@@ -296,6 +308,10 @@ func (c *Conn) lockedReceive() ([]Message, error) {
 			d.debugf(1, "recv: %+v", m)
 		})
 
+		if skipAcknowledgement && m.Header.Type == Error {
+			continue
+		}
+
 		msgs = append(msgs, m)
 	}
 
@@ -305,7 +321,7 @@ func (c *Conn) lockedReceive() ([]Message, error) {
 // lockedReceiveIter returns an iterator which can be used to receive messages
 // from netlink, but must be called with c.mu acquired for the duration of the
 // iteration.
-func (c *Conn) lockedReceiveIter() iter.Seq2[Message, error] {
+func (c *Conn) lockedReceiveIter(request *Message) iter.Seq2[Message, error] {
 	return func(yield func(Message, error) bool) {
 		// NB: All non-nil errors returned from this function *must* be of type
 		// OpError in order to maintain the appropriate contract with callers of
@@ -314,55 +330,100 @@ func (c *Conn) lockedReceiveIter() iter.Seq2[Message, error] {
 		// This contract also applies to functions called within this function,
 		// such as checkMessage.
 
-		var more, stopped bool
-		// send is a helper function to prevent yielding messages after the user
-		// has stopped iterating
-		send := func(m Message, err error) {
-			if stopped {
-				return
-			}
-			if !yield(m, err) {
-				stopped = true
-			}
+		if err := c.checkUsable(); err != nil {
+			yield(Message{}, err)
+			return
+		}
+
+		var more bool
+		send := func(m Message, err error) bool {
+			return yield(m, err)
 		}
 
 		for {
-			more = false
+			batchMore := false
+			var sawDone bool
 			for m, err := range c.sock.ReceiveIter() {
 				if err != nil {
-					send(Message{}, newOpError("receive", err))
+					send(Message{}, c.receiveError(err))
 					return
+				}
+
+				length := m.Header.Length
+				if length != 0 && (length < uint32(nlmsgHeaderLen) ||
+					int(length) > nlmsgAlign(len(m.Data)+nlmsgHeaderLen)) {
+					send(Message{}, c.receiveError(errShortMessage))
+					return
+				}
+
+				if request != nil {
+					isDone := m.Header.Type == Done && m.Header.Flags&Multi != 0
+					if !isDone {
+						if err := Validate(*request, []Message{m}); err != nil {
+							c.broken.Store(true)
+							send(Message{}, err)
+							return
+						}
+					}
 				}
 
 				if err := checkMessage(m); err != nil {
 					send(Message{}, err)
 					return
 				}
-
-				// Exit early if we encounter a multi-part done message.
-				// This should be safe to do since messages of type Done should always
-				// be the last message in a datagram.
 				if m.Header.Type == Done && m.Header.Flags&Multi != 0 {
+					sawDone = true
+					return
+				}
+
+				if m.Header.Type == Error {
+					// A complete NLMSG_ERROR terminates this receive, even a
+					// successful acknowledgement following multipart data.
+					sawDone = true
+					if !send(m, nil) {
+						c.broken.Store(true)
+					}
 					return
 				}
 
 				if m.Header.Flags&Multi != 0 {
+					batchMore = true
 					more = true
 				}
 
-				send(m, nil)
-				if stopped && !more {
-					// The user has stopped iterating and there are no more messages
-					// to read.
+				if !send(m, nil) {
+					// The caller stopped before the iterator reached Done.
+					// Do not make another blocking read to drain the response:
+					// that would defeat cancellation. Mark the connection
+					// unusable so the unread tail can never be returned by the
+					// next transaction.
+					if more {
+						c.broken.Store(true)
+					}
 					return
 				}
 			}
 
-			if !more {
-				return
+			if batchMore && !sawDone {
+				continue
 			}
+
+			return
 		}
 	}
+}
+
+func (c *Conn) checkUsable() error {
+	if c.broken.Load() {
+		return newOpError("connection", errConnUnusable)
+	}
+
+	return nil
+}
+
+func (c *Conn) receiveError(err error) error {
+	c.broken.Store(true)
+	return newOpError("receive", err)
 }
 
 // A groupJoinLeaver is a Socket that supports joining and leaving

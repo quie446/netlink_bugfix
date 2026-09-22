@@ -13,6 +13,7 @@ var (
 	errMismatchedSequence = errors.New("mismatched sequence in netlink reply")
 	errMismatchedPID      = errors.New("mismatched PID in netlink reply")
 	errShortErrorMessage  = errors.New("not enough data for netlink error code")
+	errConnUnusable       = errors.New("netlink connection is unusable")
 )
 
 // Errors which can be returned by a Socket that does not implement
@@ -78,6 +79,10 @@ type OpError struct {
 	// error. This field is only populated if the error was produced as the
 	// result of a netlink message; otherwise, it will be zero.
 	Sequence uint32
+
+	// NLMSGError reports whether Err was returned in an NLMSG_ERROR netlink
+	// message. Transport failures such as read timeouts do not set this field.
+	NLMSGError bool
 }
 
 // newOpError is a small wrapper for creating an OpError. As a convenience, it

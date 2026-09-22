@@ -379,13 +379,8 @@ func TestConnReceiveIterMultipaEarlyExit(t *testing.T) {
 		break
 	}
 
-	got, err := c.Receive()
-	if err != nil {
-		t.Fatalf("failed to receive messages: %v", err)
-	}
-
-	// Early exit should have drained the buffer.
-	if diff := cmp.Diff([]netlink.Message(nil), got); diff != "" {
-		t.Fatalf("unexpected messages after early exit from multipart response (-want +got):\n%s", diff)
+	_, err := c.Receive()
+	if err == nil || !strings.Contains(err.Error(), "unusable") {
+		t.Fatalf("expected unusable connection after multipart early exit, got: %v", err)
 	}
 }

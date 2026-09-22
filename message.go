@@ -305,7 +305,7 @@ func checkMessage(m Message) error {
 	// Errno occupies 4 bytes.
 	const endErrno = 4
 	if len(m.Data) < endErrno {
-		return newOpError("receive", errShortErrorMessage)
+		return &OpError{Op: "receive", Err: errShortErrorMessage, NLMSGError: true}
 	}
 
 	c := int32(binary.NativeEndian.Uint32(m.Data[:endErrno]))
@@ -319,8 +319,9 @@ func checkMessage(m Message) error {
 		// Error code is a negative integer, convert it into an OS-specific raw
 		// system call error, but do not wrap with os.NewSyscallError to signify
 		// that this error was produced by a netlink message; not a system call.
-		Err:      newError(-1 * int(c)),
-		Sequence: m.Header.Sequence,
+		Err:        newError(-1 * int(c)),
+		Sequence:   m.Header.Sequence,
+		NLMSGError: true,
 	}
 
 	// TODO(mdlayher): investigate the Capped flag.
@@ -336,7 +337,7 @@ func checkMessage(m Message) error {
 	if hasHeader {
 		// There is an nlmsghdr preceding the TLVs.
 		if len(m.Data) < endErrno+nlmsgHeaderLen {
-			return newOpError("receive", errShortErrorMessage)
+			return &OpError{Op: "receive", Err: errShortErrorMessage, NLMSGError: true}
 		}
 
 		// The TLVs should be at the offset indicated by the nlmsghdr.length,
@@ -346,7 +347,7 @@ func checkMessage(m Message) error {
 		off = endErrno + int(h.Length)
 
 		if len(m.Data) < off {
-			return newOpError("receive", errShortErrorMessage)
+			return &OpError{Op: "receive", Err: errShortErrorMessage, NLMSGError: true}
 		}
 	} else {
 		// There is no nlmsghdr preceding the TLVs, parse them directly.

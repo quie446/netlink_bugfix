@@ -21,12 +21,25 @@ import (
 // A Conn is capable of manipulating netlink subsystems from within a specific
 // Linux network namespace, but special care must be taken when doing so. See
 // the documentation of Config for details.
+//
+// If a receive-side operation fails with a transport-level error (such as an
+// I/O timeout or an interrupted system call) or a reply fails sequence/PID
+// validation, the Conn is left in a permanently broken state and all
+// subsequent operations fail with ErrConnBroken. This prevents stale or
+// partial replies from a failed exchange from being misinterpreted as replies
+// to a later request. A broken Conn must be closed and replaced.
 type Conn struct {
 	// Atomics must come first.
 	//
 	// seq is an atomically incremented integer used to provide sequence
 	// numbers when Conn.Send is called.
 	seq uint32
+
+	// broken is set when a receive-side failure leaves the connection's
+	// message stream in an unknown state. Once set, all further operations
+	// fail with ErrConnBroken. See the documentation of ErrConnBroken for
+	// details.
+	broken atomic.Bool
 
 	// mu serializes access to the netlink socket for the request/response
 	// transaction within Execute.
@@ -138,6 +151,10 @@ func (c *Conn) Execute(m Message) ([]Message, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := c.checkBroken("execute"); err != nil {
+		return nil, err
+	}
+
 	req, err := c.lockedSend(m)
 	if err != nil {
 		return nil, err
@@ -149,10 +166,30 @@ func (c *Conn) Execute(m Message) ([]Message, error) {
 	}
 
 	if err := Validate(req, res); err != nil {
+		// The replies do not belong to this request, meaning the connection's
+		// message stream is desynchronized (for example, a stale reply from a
+		// previous exchange was read). Poison the connection.
+		c.poison()
 		return nil, err
 	}
 
 	return res, nil
+}
+
+// poison marks the Conn as permanently broken. All subsequent operations
+// will fail with ErrConnBroken.
+func (c *Conn) poison() {
+	c.broken.Store(true)
+}
+
+// checkBroken returns an OpError wrapping ErrConnBroken if the Conn has been
+// poisoned by a previous failure.
+func (c *Conn) checkBroken(op string) error {
+	if c.broken.Load() {
+		return newOpError(op, ErrConnBroken)
+	}
+
+	return nil
 }
 
 // SendMessages sends multiple Messages to netlink. The handling of
@@ -162,6 +199,10 @@ func (c *Conn) SendMessages(msgs []Message) ([]Message, error) {
 	// Wait for any concurrent calls to Execute to finish before proceeding.
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	if err := c.checkBroken("send-messages"); err != nil {
+		return nil, err
+	}
 
 	for i := range msgs {
 		c.fixMsg(&msgs[i], nlmsgLength(len(msgs[i].Data)))
@@ -202,6 +243,10 @@ func (c *Conn) Send(m Message) (Message, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	if err := c.checkBroken("send"); err != nil {
+		return Message{}, err
+	}
+
 	return c.lockedSend(m)
 }
 
@@ -236,6 +281,10 @@ func (c *Conn) Receive() ([]Message, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	if err := c.checkBroken("receive"); err != nil {
+		return nil, err
+	}
+
 	// Serialize concurrent Receive calls. See receiveMu for details.
 	c.receiveMu.Lock()
 	defer c.receiveMu.Unlock()
@@ -254,6 +303,11 @@ func (c *Conn) ReceiveIter() iter.Seq2[Message, error] {
 		// Wait for any concurrent calls to Execute to finish before proceeding.
 		c.mu.RLock()
 		defer c.mu.RUnlock()
+
+		if err := c.checkBroken("receive"); err != nil {
+			yield(Message{}, err)
+			return
+		}
 
 		// Serialize concurrent ReceiveIter calls. See receiveMu for details.
 		c.receiveMu.Lock()
@@ -330,6 +384,13 @@ func (c *Conn) lockedReceiveIter() iter.Seq2[Message, error] {
 			more = false
 			for m, err := range c.sock.ReceiveIter() {
 				if err != nil {
+					// A transport-level receive failure (I/O timeout,
+					// interrupted system call, closed connection, or a
+					// malformed datagram) may leave a late or partial reply
+					// for this exchange queued in the socket buffer, which
+					// would desynchronize any subsequent request/response
+					// exchange. Poison the connection.
+					c.poison()
 					send(Message{}, newOpError("receive", err))
 					return
 				}

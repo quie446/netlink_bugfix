@@ -15,6 +15,19 @@ var (
 	errShortErrorMessage  = errors.New("not enough data for netlink error code")
 )
 
+// ErrConnBroken is returned by all Conn operations after a receive-side
+// failure (such as an I/O timeout, an interrupted system call, or a reply
+// which fails sequence/PID validation) has left the connection's message
+// stream in an unknown state.
+//
+// Netlink sockets are message-oriented and a failed or interrupted exchange
+// may leave a late or partial reply queued in the socket's receive buffer.
+// Rather than risking a subsequent exchange reading those stale bytes and
+// misinterpreting them as its own reply, the Conn is permanently poisoned and
+// all further operations fail with an error matching errors.Is(err,
+// ErrConnBroken). The caller must Close the Conn and Dial a new one.
+var ErrConnBroken = errors.New("netlink: connection permanently broken by a previous failed receive")
+
 // Errors which can be returned by a Socket that does not implement
 // all exposed methods of Conn.
 
